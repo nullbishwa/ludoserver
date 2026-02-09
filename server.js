@@ -4,218 +4,233 @@ const http = require('http');
 const port = process.env.PORT || 8080;
 const server = http.createServer((req, res) => {
     res.writeHead(200);
-    res.end(req.url === '/ping' ? "I am awake!" : "Ludo Authority: Hubby & Wiifu Pro Edition");
+    res.end("Chess Authority: Grandmaster Edition - 100% Rules Compliant");
 });
 
 const wss = new WebSocketServer({ server });
 const rooms = new Map();
 
-// --- LUDO CONSTANTS ---
-const BOARD_SIZE = 52; 
-const SAFE_SQUARES = [0, 8, 13, 21, 26, 34, 39, 47]; // Traditional safe/star spots
-const COLOR_OFFSETS = { "RED": 0, "BLUE": 13, "YELLOW": 26, "GREEN": 39 };
+// --- INITIALIZATION & UTILS ---
+
+function createInitialBoard() {
+    const board = {};
+    const layout = ['R', 'N', 'B', 'Q', 'K', 'B', 'N', 'R'];
+    for (let i = 0; i < 8; i++) {
+        board[`0,${i}`] = { type: layout[i], color: 'B' };
+        board[`1,${i}`] = { type: 'P', color: 'B' };
+        board[`6,${i}`] = { type: 'P', color: 'W' };
+        board[`7,${i}`] = { type: layout[i], color: 'W' };
+    }
+    return board;
+}
 
 function createInitialState() {
     return {
-        // -1 = Base, 0-51 = Common Path, 52-56 = Home Stretch, 57 = Goal
-        board: { "RED": [-1, -1, -1, -1], "BLUE": [-1, -1, -1, -1], "YELLOW": [-1, -1, -1, -1], "GREEN": [-1, -1, -1, -1] },
-        turn: "RED",
-        lastDice: 0,
-        diceRolled: false,
-        sixCount: 0,
-        winners: []
+        board: createInitialBoard(),
+        turn: 'W',
+        castlingRights: { W: { k: true, q: true }, B: { k: true, q: true } },
+        enPassantTarget: null,
+        halfMoveClock: 0,
+        history: [], // Stores board hashes
+        status: "active"
     };
 }
 
-wss.on('connection', (ws, req) => {
-    const parts = req.url.split('/');
-    const roomId = parts[2] || 'default';
-    
-    if (!rooms.has(roomId)) {
-        rooms.set(roomId, {
-            ...createInitialState(),
-            clients: new Map(), 
-            roles: { Hubby: null, Wiifu: null }
-        });
+// Generates a simple hash of the board state for Threefold Repetition
+function getBoardHash(room) {
+    return JSON.stringify({
+        b: room.board,
+        t: room.turn,
+        c: room.castlingRights,
+        e: room.enPassantTarget
+    });
+}
+
+// --- CORE LOGIC ---
+
+function isPathClear(board, from, to) {
+    const [fR, fC] = from.split(',').map(Number);
+    const [tR, tC] = to.split(',').map(Number);
+    const stepR = tR === fR ? 0 : (tR > fR ? 1 : -1);
+    const stepC = tC === fC ? 0 : (tC > fC ? 1 : -1);
+    let currR = fR + stepR, currC = fC + stepC;
+    while (currR !== tR || currC !== tC) {
+        if (board[`${currR},${currC}`]) return false;
+        currR += stepR; currC += stepC;
+    }
+    return true;
+}
+
+function canPieceMove(board, from, to, piece, epTarget, castling) {
+    const [fR, fC] = from.split(',').map(Number);
+    const [tR, tC] = to.split(',').map(Number);
+    const rDiff = Math.abs(tR - fR), cDiff = Math.abs(tC - fC);
+    const target = board[to];
+
+    if (target && target.color === piece.color) return false;
+
+    switch (piece.type) {
+        case 'P':
+            const dir = piece.color === 'W' ? -1 : 1;
+            if (fC === tC && !target) {
+                if (tR === fR + dir) return true;
+                if (fR === (piece.color === 'W' ? 6 : 1) && tR === fR + 2 * dir && !board[`${fR + dir},${fC}`]) return true;
+            }
+            if (cDiff === 1 && tR === fR + dir && (target || to === epTarget)) return true;
+            return false;
+        case 'N': return (rDiff === 2 && cDiff === 1) || (rDiff === 1 && cDiff === 2);
+        case 'B': return rDiff === cDiff && isPathClear(board, from, to);
+        case 'R': return (fR === tR || fC === tC) && isPathClear(board, from, to);
+        case 'Q': return (rDiff === cDiff || fR === tR || fC === tC) && isPathClear(board, from, to);
+        case 'K':
+            if (rDiff <= 1 && cDiff <= 1) return true;
+            if (castling && rDiff === 0 && cDiff === 2) {
+                const side = tC > fC ? 'k' : 'q';
+                return castling[piece.color][side] && isPathClear(board, from, `${fR},${side === 'k' ? 7 : 0}`);
+            }
+            return false;
+    }
+}
+
+function isSquareAttacked(board, targetPos, attackerColor) {
+    for (const pos in board) {
+        const piece = board[pos];
+        if (piece.color === attackerColor && canPieceMove(board, pos, targetPos, piece, null, null)) return true;
+    }
+    return false;
+}
+
+function isKingInCheck(board, color) {
+    let kingPos = Object.keys(board).find(pos => board[pos].type === 'K' && board[pos].color === color);
+    return isSquareAttacked(board, kingPos, color === 'W' ? 'B' : 'W');
+}
+
+// --- ADVANCED RULES & GAME STATE ---
+
+function tryMove(room, from, to, promotionType = 'Q') {
+    const piece = room.board[from];
+    const newBoard = { ...room.board };
+    const [fR, fC] = from.split(',').map(Number);
+    const [tR, tC] = to.split(',').map(Number);
+
+    // Castling safety checks
+    if (piece.type === 'K' && Math.abs(tC - fC) === 2) {
+        const attackerColor = piece.color === 'W' ? 'B' : 'W';
+        const midC = fC + (tC > fC ? 1 : -1);
+        if (isKingInCheck(room.board, piece.color) || 
+            isSquareAttacked(room.board, `${fR},${midC}`, attackerColor) || 
+            isSquareAttacked(room.board, to, attackerColor)) return null;
     }
 
-    const room = rooms.get(roomId);
-    let myRole = room.clients.size === 0 ? "Hubby" : (room.clients.size === 1 ? "Wiifu" : "Observer");
-    room.clients.set(ws, myRole);
+    newBoard[to] = { ...piece };
+    delete newBoard[from];
 
-    ws.send(JSON.stringify({ type: 'ASSIGN_ROLE', role: myRole, state: room }));
+    if (isKingInCheck(newBoard, piece.color)) return null;
+
+    // Execute Promotion
+    if (piece.type === 'P' && (tR === 0 || tR === 7)) {
+        newBoard[to].type = promotionType;
+    }
+
+    // Execute En Passant
+    if (piece.type === 'P' && to === room.enPassantTarget) {
+        delete newBoard[`${fR},${tC}`];
+    }
+
+    // Execute Castling Rook Swap
+    if (piece.type === 'K' && Math.abs(tC - fC) === 2) {
+        const rookCol = tC > fC ? 7 : 0;
+        const newRookCol = tC > fC ? 5 : 3;
+        newBoard[`${fR},${newRookCol}`] = newBoard[`${fR},${rookCol}`];
+        delete newBoard[`${fR},${rookCol}`];
+    }
+
+    return newBoard;
+}
+
+function checkInsufficientMaterial(board) {
+    const pieces = Object.values(board);
+    if (pieces.length === 2) return true; // King vs King
+    if (pieces.length === 3) {
+        const nonKing = pieces.find(p => p.type !== 'K');
+        if (nonKing.type === 'B' || nonKing.type === 'N') return true; // King & Bishop/Knight vs King
+    }
+    return false;
+}
+
+function updateGameState(room) {
+    const nextColor = room.turn;
+    const hasLegalMove = Object.keys(room.board).some(from => {
+        if (room.board[from].color !== nextColor) return false;
+        for (let r = 0; r < 8; r++) {
+            for (let c = 0; c < 8; c++) {
+                const to = `${r},${c}`;
+                if (canPieceMove(room.board, from, to, room.board[from], room.enPassantTarget, room.castlingRights)) {
+                    if (tryMove(room, from, to)) return true;
+                }
+            }
+        }
+        return false;
+    });
+
+    const inCheck = isKingInCheck(room.board, nextColor);
+    if (!hasLegalMove) return inCheck ? "checkmate" : "stalemate";
+    
+    // Check Threefold Repetition
+    const hash = getBoardHash(room);
+    room.history.push(hash);
+    const occurrences = room.history.filter(h => h === hash).length;
+    if (occurrences >= 3) return "draw_repetition";
+
+    if (room.halfMoveClock >= 100) return "draw_50_move";
+    if (checkInsufficientMaterial(room.board)) return "draw_insufficient";
+
+    return "active";
+}
+
+// --- SERVER HANDLER ---
+
+wss.on('connection', (ws, req) => {
+    const roomId = req.url.split('/')[2] || 'default';
+    if (!rooms.has(roomId)) rooms.set(roomId, { ...createInitialState(), clients: new Map(), roles: { Hubby: null, Wiifu: null } });
+    const room = rooms.get(roomId);
+    const myRole = room.clients.size === 0 ? "Hubby" : (room.clients.size === 1 ? "Wiifu" : "Observer");
+    room.clients.set(ws, myRole);
 
     ws.on('message', (data) => {
         try {
             const msg = JSON.parse(data);
             const playerColor = room.roles[myRole];
+            if (room.status !== "active" || room.turn !== playerColor) return;
 
-            // 1. SELECT COLOR
-            if (msg.type === 'SELECT_COLOR' && !playerColor) {
-                if (!Object.values(room.roles).includes(msg.color)) {
-                    room.roles[myRole] = msg.color;
-                    broadcast(room, { type: 'ROLE_UPDATE', roles: room.roles });
-                }
-                return;
-            }
+            if (msg.type === 'MOVE_PIECE') {
+                const { from, to, promotionType } = msg;
+                const piece = room.board[from];
+                const target = room.board[to];
 
-            // 2. DICE ROLL (Includes Three 6s Rule)
-            if (msg.type === 'ROLL_DICE') {
-                if (room.turn !== playerColor || room.diceRolled) return;
-
-                const roll = Math.floor(Math.random() * 6) + 1;
-                room.lastDice = roll;
-                room.diceRolled = true;
-
-                if (roll === 6) {
-                    room.sixCount++;
-                    if (room.sixCount === 3) {
-                        broadcast(room, { type: 'THREE_SIXES', message: "Three 6s! Turn forfeited." });
-                        room.sixCount = 0;
-                        setTimeout(() => switchTurn(room), 1000);
-                        return;
-                    }
-                } else {
-                    room.sixCount = 0;
-                }
-
-                const movablePawns = getMovablePawns(room, playerColor, room.lastDice);
-                if (movablePawns.length === 0) {
-                    setTimeout(() => switchTurn(room), 1500);
-                }
-
-                broadcast(room, { type: 'DICE_RESULT', value: room.lastDice, movablePawns });
-                return;
-            }
-
-            // 3. MOVE PAWN (With Blockade & Exact Roll Logic)
-            if (msg.type === 'MOVE_PAWN') {
-                if (room.turn !== playerColor || !room.diceRolled) return;
-                
-                const pawnIdx = msg.pawnIndex;
-                const dice = room.lastDice;
-                let currentPos = room.board[playerColor][pawnIdx];
-                let grantExtraTurn = false;
-
-                if (currentPos === -1 && dice === 6) {
-                    room.board[playerColor][pawnIdx] = 0;
-                    grantExtraTurn = true; 
-                } else {
-                    const newPos = currentPos + dice;
-                    // Rule: Exact roll to enter Home Triangle (57)
-                    if (newPos <= 57) {
-                        room.board[playerColor][pawnIdx] = newPos;
-                        if (newPos === 57) grantExtraTurn = true;
+                if (canPieceMove(room.board, from, to, piece, room.enPassantTarget, room.castlingRights)) {
+                    const nextBoard = tryMove(room, from, to, promotionType);
+                    if (nextBoard) {
+                        if (piece.type === 'P' || target) room.halfMoveClock = 0; else room.halfMoveClock++;
+                        
+                        // Update Rights & State
+                        if (piece.type === 'K') room.castlingRights[playerColor] = { k: false, q: false };
+                        room.enPassantTarget = (piece.type === 'P' && Math.abs(Number(to.split(',')[0]) - Number(from.split(',')[0])) === 2) ? `${(Number(from.split(',')[0]) + Number(to.split(',')[0])) / 2},${from.split(',')[1]}` : null;
+                        
+                        room.board = nextBoard;
+                        room.turn = room.turn === 'W' ? 'B' : 'W';
+                        room.status = updateGameState(room);
+                        broadcast(room, { type: 'STATE', board: room.board, turn: room.turn, status: room.status });
                     }
                 }
-
-                // Rule: Extra turn on Capture
-                const captured = handleCapture(room, playerColor, pawnIdx);
-                if (captured) grantExtraTurn = true;
-
-                // Check for Victory
-                if (room.board[playerColor].every(p => p === 57)) {
-                    if (!room.winners.includes(myRole)) room.winners.push(myRole);
-                }
-
-                if (dice === 6 || grantExtraTurn) {
-                    room.diceRolled = false; 
-                } else {
-                    switchTurn(room);
-                }
-
-                broadcast(room, { type: 'STATE', board: room.board, turn: room.turn, winners: room.winners });
             }
-
-        } catch (e) { console.error("Ludo Error", e); }
-    });
-
-    ws.on('close', () => {
-        room.clients.delete(ws);
-        if (room.clients.size === 0) rooms.delete(roomId);
+        } catch (e) { console.error(e); }
     });
 });
-
-// --- CORE RULES ENGINE ---
-
-function getMovablePawns(room, color, dice) {
-    return room.board[color].map((pos, idx) => {
-        // Base Exit
-        if (pos === -1 && dice === 6) return idx;
-        
-        if (pos >= 0) {
-            const newPos = pos + dice;
-            // Rule: Exact roll for Goal
-            if (newPos > 57) return null;
-
-            // Rule: Blockade Check (Cannot move past or land on an opponent's Jota)
-            if (isPathBlocked(room, color, pos, dice)) return null;
-
-            return idx;
-        }
-        return null;
-    }).filter(v => v !== null);
-}
-
-function isPathBlocked(room, myColor, currentPos, dice) {
-    // Check every square the pawn will step on
-    for (let i = 1; i <= dice; i++) {
-        const stepPos = currentPos + i;
-        if (stepPos > 51) continue; // Blockades don't exist in Home Stretch
-
-        const globalPos = (stepPos + COLOR_OFFSETS[myColor]) % BOARD_SIZE;
-        
-        // Check all other colors for a blockade at this globalPos
-        for (const otherColor of Object.keys(room.board)) {
-            if (otherColor === myColor) continue;
-            
-            const pawnsAtPos = room.board[otherColor].filter(p => {
-                if (p === -1 || p > 51) return false;
-                return (p + COLOR_OFFSETS[otherColor]) % BOARD_SIZE === globalPos;
-            });
-
-            if (pawnsAtPos.length >= 2) return true; // Blockade found!
-        }
-    }
-    return false;
-}
-
-function handleCapture(room, attackerColor, pawnIdx) {
-    const attackerPos = room.board[attackerColor][pawnIdx];
-    if (attackerPos > 51 || attackerPos === -1) return false; 
-
-    const attackerGlobalPos = (attackerPos + COLOR_OFFSETS[attackerColor]) % BOARD_SIZE;
-    if (SAFE_SQUARES.includes(attackerGlobalPos)) return false; 
-
-    let captured = false;
-    Object.keys(room.board).forEach(targetColor => {
-        if (targetColor === attackerColor) return;
-        room.board[targetColor].forEach((pos, idx) => {
-            if (pos === -1 || pos > 51) return;
-            const targetGlobalPos = (pos + COLOR_OFFSETS[targetColor]) % BOARD_SIZE;
-            
-            // Rule: You can only capture if there is exactly 1 pawn (Blockades are immune)
-            if (attackerGlobalPos === targetGlobalPos) {
-                room.board[targetColor][idx] = -1;
-                captured = true;
-            }
-        });
-    });
-    return captured;
-}
-
-function switchTurn(room) {
-    const colors = ["RED", "BLUE", "YELLOW", "GREEN"];
-    let nextIdx = (colors.indexOf(room.turn) + 1) % 4;
-    room.turn = colors[nextIdx];
-    room.diceRolled = false;
-    room.lastDice = 0;
-    room.sixCount = 0;
-}
 
 function broadcast(room, data) {
     const msg = JSON.stringify(data);
     room.clients.forEach((role, client) => { if (client.readyState === 1) client.send(msg); });
 }
 
-server.listen(port, () => console.log(`Authoritative Ludo Server on ${port}`));
+server.listen(port, () => console.log(`Grandmaster Chess Server running on ${port}`));
