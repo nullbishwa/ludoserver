@@ -2,235 +2,184 @@ const { WebSocketServer } = require('ws');
 const http = require('http');
 
 const port = process.env.PORT || 8080;
+
 const server = http.createServer((req, res) => {
     res.writeHead(200);
-    res.end("Chess Authority: Grandmaster Edition - 100% Rules Compliant");
+    res.end(req.url === '/ping' ? "I am awake!" : "Hubby & Wiifu Hybrid Server Running");
 });
 
 const wss = new WebSocketServer({ server });
 const rooms = new Map();
 
-// --- INITIALIZATION & UTILS ---
+const initialChessBoard = [
+    "bR", "bN", "bB", "bQ", "bK", "bB", "bN", "bR",
+    "bP", "bP", "bP", "bP", "bP", "bP", "bP", "bP",
+    ...Array(32).fill(null),
+    "wP", "wP", "wP", "wP", "wP", "wP", "wP", "wP",
+    "wR", "wN", "wB", "wQ", "wK", "wB", "wN", "wR"
+];
 
-function createInitialBoard() {
-    const board = {};
-    const layout = ['R', 'N', 'B', 'Q', 'K', 'B', 'N', 'R'];
-    for (let i = 0; i < 8; i++) {
-        board[`0,${i}`] = { type: layout[i], color: 'B' };
-        board[`1,${i}`] = { type: 'P', color: 'B' };
-        board[`6,${i}`] = { type: 'P', color: 'W' };
-        board[`7,${i}`] = { type: layout[i], color: 'W' };
-    }
-    return board;
+// --- CORE GAME ENGINE ---
+
+function simulateMove(board, from, to) {
+    const newBoard = [...board];
+    newBoard[to] = newBoard[from];
+    newBoard[from] = null;
+    return newBoard;
 }
 
-function createInitialState() {
-    return {
-        board: createInitialBoard(),
-        turn: 'W',
-        castlingRights: { W: { k: true, q: true }, B: { k: true, q: true } },
-        enPassantTarget: null,
-        halfMoveClock: 0,
-        history: [], // Stores board hashes
-        status: "active"
-    };
-}
-
-// Generates a simple hash of the board state for Threefold Repetition
-function getBoardHash(room) {
-    return JSON.stringify({
-        b: room.board,
-        t: room.turn,
-        c: room.castlingRights,
-        e: room.enPassantTarget
-    });
-}
-
-// --- CORE LOGIC ---
-
-function isPathClear(board, from, to) {
-    const [fR, fC] = from.split(',').map(Number);
-    const [tR, tC] = to.split(',').map(Number);
-    const stepR = tR === fR ? 0 : (tR > fR ? 1 : -1);
-    const stepC = tC === fC ? 0 : (tC > fC ? 1 : -1);
-    let currR = fR + stepR, currC = fC + stepC;
-    while (currR !== tR || currC !== tC) {
-        if (board[`${currR},${currC}`]) return false;
-        currR += stepR; currC += stepC;
+function isPathClear(from, to, board) {
+    const fromRow = Math.floor(from / 8), fromCol = from % 8;
+    const toRow = Math.floor(to / 8), toCol = to % 8;
+    const rStep = toRow === fromRow ? 0 : (toRow > fromRow ? 1 : -1);
+    const cStep = toCol === fromCol ? 0 : (toCol > fromCol ? 1 : -1);
+    let r = fromRow + rStep, c = fromCol + cStep;
+    while (r !== toRow || c !== toCol) {
+        if (board[r * 8 + c]) return false;
+        r += rStep; c += cStep;
     }
     return true;
 }
 
-function canPieceMove(board, from, to, piece, epTarget, castling) {
-    const [fR, fC] = from.split(',').map(Number);
-    const [tR, tC] = to.split(',').map(Number);
-    const rDiff = Math.abs(tR - fR), cDiff = Math.abs(tC - fC);
+function isMoveLegal(from, to, board, playerColor, state, skipKingCheck = false) {
+    const piece = board[from];
+    if (!piece || piece[0] !== playerColor) return false;
     const target = board[to];
+    if (target && target[0] === playerColor) return false;
+    
+    const fromRow = Math.floor(from / 8), fromCol = from % 8;
+    const toRow = Math.floor(to / 8), toCol = to % 8;
+    const rowDiff = Math.abs(toRow - fromRow);
+    const colDiff = Math.abs(toCol - fromCol);
 
-    if (target && target.color === piece.color) return false;
-
-    switch (piece.type) {
+    let legal = false;
+    switch (piece[1]) {
         case 'P':
-            const dir = piece.color === 'W' ? -1 : 1;
-            if (fC === tC && !target) {
-                if (tR === fR + dir) return true;
-                if (fR === (piece.color === 'W' ? 6 : 1) && tR === fR + 2 * dir && !board[`${fR + dir},${fC}`]) return true;
+            const dir = playerColor === 'w' ? -1 : 1;
+            if (fromCol === toCol && !target) {
+                if (toRow === fromRow + dir) legal = true;
+                else if (fromRow === (playerColor === 'w' ? 6 : 1) && toRow === fromRow + 2 * dir && !board[from + 8 * dir]) legal = true;
+            } else if (colDiff === 1 && toRow === fromRow + dir) {
+                if (target || state.enPassantTarget === to) legal = true;
             }
-            if (cDiff === 1 && tR === fR + dir && (target || to === epTarget)) return true;
-            return false;
-        case 'N': return (rDiff === 2 && cDiff === 1) || (rDiff === 1 && cDiff === 2);
-        case 'B': return rDiff === cDiff && isPathClear(board, from, to);
-        case 'R': return (fR === tR || fC === tC) && isPathClear(board, from, to);
-        case 'Q': return (rDiff === cDiff || fR === tR || fC === tC) && isPathClear(board, from, to);
+            break;
+        case 'R': legal = (fromRow === toRow || fromCol === toCol) && isPathClear(from, to, board); break;
+        case 'B': legal = (rowDiff === colDiff) && isPathClear(from, to, board); break;
+        case 'Q': legal = (rowDiff === colDiff || fromRow === toRow || fromCol === toCol) && isPathClear(from, to, board); break;
+        case 'N': legal = (rowDiff === 2 && colDiff === 1) || (rowDiff === 1 && colDiff === 2); break;
         case 'K':
-            if (rDiff <= 1 && cDiff <= 1) return true;
-            if (castling && rDiff === 0 && cDiff === 2) {
-                const side = tC > fC ? 'k' : 'q';
-                return castling[piece.color][side] && isPathClear(board, from, `${fR},${side === 'k' ? 7 : 0}`);
-            }
-            return false;
-    }
-}
-
-function isSquareAttacked(board, targetPos, attackerColor) {
-    for (const pos in board) {
-        const piece = board[pos];
-        if (piece.color === attackerColor && canPieceMove(board, pos, targetPos, piece, null, null)) return true;
-    }
-    return false;
-}
-
-function isKingInCheck(board, color) {
-    let kingPos = Object.keys(board).find(pos => board[pos].type === 'K' && board[pos].color === color);
-    return isSquareAttacked(board, kingPos, color === 'W' ? 'B' : 'W');
-}
-
-// --- ADVANCED RULES & GAME STATE ---
-
-function tryMove(room, from, to, promotionType = 'Q') {
-    const piece = room.board[from];
-    const newBoard = { ...room.board };
-    const [fR, fC] = from.split(',').map(Number);
-    const [tR, tC] = to.split(',').map(Number);
-
-    // Castling safety checks
-    if (piece.type === 'K' && Math.abs(tC - fC) === 2) {
-        const attackerColor = piece.color === 'W' ? 'B' : 'W';
-        const midC = fC + (tC > fC ? 1 : -1);
-        if (isKingInCheck(room.board, piece.color) || 
-            isSquareAttacked(room.board, `${fR},${midC}`, attackerColor) || 
-            isSquareAttacked(room.board, to, attackerColor)) return null;
-    }
-
-    newBoard[to] = { ...piece };
-    delete newBoard[from];
-
-    if (isKingInCheck(newBoard, piece.color)) return null;
-
-    // Execute Promotion
-    if (piece.type === 'P' && (tR === 0 || tR === 7)) {
-        newBoard[to].type = promotionType;
-    }
-
-    // Execute En Passant
-    if (piece.type === 'P' && to === room.enPassantTarget) {
-        delete newBoard[`${fR},${tC}`];
-    }
-
-    // Execute Castling Rook Swap
-    if (piece.type === 'K' && Math.abs(tC - fC) === 2) {
-        const rookCol = tC > fC ? 7 : 0;
-        const newRookCol = tC > fC ? 5 : 3;
-        newBoard[`${fR},${newRookCol}`] = newBoard[`${fR},${rookCol}`];
-        delete newBoard[`${fR},${rookCol}`];
-    }
-
-    return newBoard;
-}
-
-function checkInsufficientMaterial(board) {
-    const pieces = Object.values(board);
-    if (pieces.length === 2) return true; // King vs King
-    if (pieces.length === 3) {
-        const nonKing = pieces.find(p => p.type !== 'K');
-        if (nonKing.type === 'B' || nonKing.type === 'N') return true; // King & Bishop/Knight vs King
-    }
-    return false;
-}
-
-function updateGameState(room) {
-    const nextColor = room.turn;
-    const hasLegalMove = Object.keys(room.board).some(from => {
-        if (room.board[from].color !== nextColor) return false;
-        for (let r = 0; r < 8; r++) {
-            for (let c = 0; c < 8; c++) {
-                const to = `${r},${c}`;
-                if (canPieceMove(room.board, from, to, room.board[from], room.enPassantTarget, room.castlingRights)) {
-                    if (tryMove(room, from, to)) return true;
+            if (rowDiff <= 1 && colDiff <= 1) legal = true;
+            else if (rowDiff === 0 && colDiff === 2 && !state.movedPieces.has(from)) {
+                const isKingside = toCol > fromCol;
+                const rookIdx = isKingside ? from + 3 : from - 4;
+                if (board[rookIdx] && !state.movedPieces.has(rookIdx) && isPathClear(from, rookIdx, board)) {
+                    if (!isKingInCheck(board, playerColor, state)) legal = true;
                 }
             }
-        }
-        return false;
-    });
-
-    const inCheck = isKingInCheck(room.board, nextColor);
-    if (!hasLegalMove) return inCheck ? "checkmate" : "stalemate";
-    
-    // Check Threefold Repetition
-    const hash = getBoardHash(room);
-    room.history.push(hash);
-    const occurrences = room.history.filter(h => h === hash).length;
-    if (occurrences >= 3) return "draw_repetition";
-
-    if (room.halfMoveClock >= 100) return "draw_50_move";
-    if (checkInsufficientMaterial(room.board)) return "draw_insufficient";
-
-    return "active";
+            break;
+    }
+    if (!legal) return false;
+    if (skipKingCheck) return true;
+    return !isKingInCheck(simulateMove(board, from, to), playerColor, state);
 }
 
-// --- SERVER HANDLER ---
+function isKingInCheck(board, color, state) {
+    const kingPos = board.indexOf(color + 'K');
+    if (kingPos === -1) return false;
+    const enemy = color === 'w' ? 'b' : 'w';
+    for (let i = 0; i < 64; i++) {
+        if (board[i] && board[i][0] === enemy) {
+            if (isMoveLegal(i, kingPos, board, enemy, { ...state, enPassantTarget: -1 }, true)) return true;
+        }
+    }
+    return false;
+}
+
+function hasLegalMoves(board, color, state) {
+    for (let i = 0; i < 64; i++) {
+        if (board[i] && board[i][0] === color) {
+            for (let j = 0; j < 64; j++) {
+                if (isMoveLegal(i, j, board, color, state, false)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+// --- WEBSOCKET LOGIC ---
 
 wss.on('connection', (ws, req) => {
-    const roomId = req.url.split('/')[2] || 'default';
-    if (!rooms.has(roomId)) rooms.set(roomId, { ...createInitialState(), clients: new Map(), roles: { Hubby: null, Wiifu: null } });
+    const parts = req.url.split('/');
+    const roomId = parts[2] || 'default';
+    const size = parseInt(parts[3]) || 3;
+
+    if (!rooms.has(roomId)) {
+        const hubbyIsWhite = Math.random() < 0.5;
+        rooms.set(roomId, {
+            board: size === 8 ? [...initialChessBoard] : Array(size * size).fill(null),
+            clients: new Map(),
+            size, turn: 'w',
+            movedPieces: new Set(),
+            enPassantTarget: -1,
+            roles: { Hubby: hubbyIsWhite ? 'w' : 'b', Wiifu: hubbyIsWhite ? 'b' : 'w' }
+        });
+    }
+
     const room = rooms.get(roomId);
-    const myRole = room.clients.size === 0 ? "Hubby" : (room.clients.size === 1 ? "Wiifu" : "Observer");
+    let myRole = room.clients.size === 0 ? "Hubby" : (room.clients.size === 1 ? "Wiifu" : "Observer");
     room.clients.set(ws, myRole);
+    const myColor = room.roles[myRole] || 'observer';
+
+    ws.send(JSON.stringify({ type: 'ASSIGN_ROLE', role: myRole, color: myColor }));
+    ws.send(JSON.stringify({ type: 'STATE', board: room.board, turn: room.turn, hubbyColor: room.roles.Hubby, wiifuColor: room.roles.Wiifu }));
 
     ws.on('message', (data) => {
         try {
             const msg = JSON.parse(data);
-            const playerColor = room.roles[myRole];
-            if (room.status !== "active" || room.turn !== playerColor) return;
+            if (msg.type === 'EMOTE') {
+                const res = JSON.stringify({ type: 'EMOTE', emoji: msg.emoji, sender: myRole });
+                room.clients.forEach((r, client) => { if (client.readyState === 1) client.send(res); });
+                return;
+            }
 
-            if (msg.type === 'MOVE_PIECE') {
-                const { from, to, promotionType } = msg;
-                const piece = room.board[from];
-                const target = room.board[to];
-
-                if (canPieceMove(room.board, from, to, piece, room.enPassantTarget, room.castlingRights)) {
-                    const nextBoard = tryMove(room, from, to, promotionType);
-                    if (nextBoard) {
-                        if (piece.type === 'P' || target) room.halfMoveClock = 0; else room.halfMoveClock++;
-                        
-                        // Update Rights & State
-                        if (piece.type === 'K') room.castlingRights[playerColor] = { k: false, q: false };
-                        room.enPassantTarget = (piece.type === 'P' && Math.abs(Number(to.split(',')[0]) - Number(from.split(',')[0])) === 2) ? `${(Number(from.split(',')[0]) + Number(to.split(',')[0])) / 2},${from.split(',')[1]}` : null;
-                        
-                        room.board = nextBoard;
-                        room.turn = room.turn === 'W' ? 'B' : 'W';
-                        room.status = updateGameState(room);
-                        broadcast(room, { type: 'STATE', board: room.board, turn: room.turn, status: room.status });
+            if (msg.type === 'RESET') {
+                room.board = size === 8 ? [...initialChessBoard] : Array(size * size).fill(null);
+                room.turn = 'w'; room.movedPieces.clear(); room.enPassantTarget = -1;
+            } else if (msg.type === 'MOVE') {
+                if (size === 8) {
+                    if (room.turn !== myColor) return;
+                    if (isMoveLegal(msg.from, msg.to, room.board, myColor, room)) {
+                        let tempBoard = simulateMove(room.board, msg.from, msg.to);
+                        // Pawn Promotion & Special moves logic
+                        room.board = tempBoard;
+                        room.movedPieces.add(msg.from);
+                        room.turn = room.turn === 'w' ? 'b' : 'w';
                     }
+                } else {
+                    room.board[msg.index] = myColor === 'w' ? 'X' : 'O';
                 }
             }
-        } catch (e) { console.error(e); }
+
+            const inCheck = size === 8 ? isKingInCheck(room.board, room.turn, room) : false;
+            const noMoves = size === 8 ? !hasLegalMoves(room.board, room.turn, room) : false;
+
+            const stateRes = JSON.stringify({
+                type: 'STATE', board: room.board, turn: room.turn,
+                inCheck, winner: (noMoves && inCheck) ? (myRole) : null,
+                isDraw: (noMoves && !inCheck), hubbyColor: room.roles.Hubby, wiifuColor: room.roles.Wiifu
+            });
+
+            room.clients.forEach((r, client) => { if (client.readyState === 1) client.send(stateRes); });
+        } catch (e) { console.log(e); }
+    });
+
+    ws.on('close', () => {
+        const role = room.clients.get(ws);
+        room.clients.delete(ws);
+        if (room.clients.size > 0) {
+            room.clients.forEach((r, c) => c.send(JSON.stringify({ type: 'KICK', message: `${role} left.` })));
+        } else rooms.delete(roomId);
     });
 });
 
-function broadcast(room, data) {
-    const msg = JSON.stringify(data);
-    room.clients.forEach((role, client) => { if (client.readyState === 1) client.send(msg); });
-}
-
-server.listen(port, () => console.log(`Grandmaster Chess Server running on ${port}`));
+server.listen(port, () => console.log(`Hybrid Server on ${port}`));
