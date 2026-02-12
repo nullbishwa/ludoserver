@@ -3,6 +3,7 @@ const http = require('http');
 
 const port = process.env.PORT || 8080;
 
+// Basic HTTP server for health checks
 const server = http.createServer((req, res) => {
     res.writeHead(200);
     res.end(req.url === '/ping' ? "I am awake!" : "Hubby & Wiifu Hybrid Server Running");
@@ -11,6 +12,7 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server });
 const rooms = new Map();
 
+// Initial Chess Board Setup
 const initialChessBoard = [
     "bR", "bN", "bB", "bQ", "bK", "bB", "bN", "bR",
     "bP", "bP", "bP", "bP", "bP", "bP", "bP", "bP",
@@ -19,7 +21,7 @@ const initialChessBoard = [
     "wR", "wN", "wB", "wQ", "wK", "wB", "wN", "wR"
 ];
 
-// --- CORE GAME ENGINE ---
+// --- CORE UTILS ---
 
 function simulateMove(board, from, to) {
     const newBoard = [...board];
@@ -41,12 +43,12 @@ function isPathClear(from, to, board) {
     return true;
 }
 
+// --- LEGALITY & CHECK ENGINE ---
+
 function isMoveLegal(from, to, board, playerColor, state, skipKingCheck = false) {
     const piece = board[from];
     if (!piece || piece[0] !== playerColor) return false;
     const target = board[to];
-    
-    // Still prevent capturing your own pieces
     if (target && target[0] === playerColor) return false;
     
     const fromRow = Math.floor(from / 8), fromCol = from % 8;
@@ -69,58 +71,55 @@ function isMoveLegal(from, to, board, playerColor, state, skipKingCheck = false)
         case 'B': legal = (rowDiff === colDiff) && isPathClear(from, to, board); break;
         case 'Q': legal = (rowDiff === colDiff || fromRow === toRow || fromCol === toCol) && isPathClear(from, to, board); break;
         case 'N': legal = (rowDiff === 2 && colDiff === 1) || (rowDiff === 1 && colDiff === 2); break;
-        case 'K':
-            if (rowDiff <= 1 && colDiff <= 1) legal = true;
-            // Castling logic removed here for brevity, keep your existing castling check if needed
-            break;
+        case 'K': if (rowDiff <= 1 && colDiff <= 1) legal = true; break;
     }
 
-    if (!legal) return false;
-
-    // --- THE "SUICIDE" CHANGE ---
-    // We skip the simulation that checks if the move puts the current player's king in danger.
-    // This allows a player to move their pawn and ignore their own King's safety.
-    
-    return true; 
+    // THE "SUICIDE" LOGIC: We return 'legal' regardless of whether our King becomes exposed.
+    return legal;
 }
+
 function isKingInCheck(board, color, state) {
     const kingPos = board.indexOf(color + 'K');
     if (kingPos === -1) return false;
-    const enemy = color === 'w' ? 'b' : 'w';
+    const enemyColor = color === 'w' ? 'b' : 'w';
+    
     for (let i = 0; i < 64; i++) {
-        if (board[i] && board[i][0] === enemy) {
-            if (isMoveLegal(i, kingPos, board, enemy, { ...state, enPassantTarget: -1 }, true)) return true;
+        if (board[i] && board[i][0] === enemyColor) {
+            // Can any enemy piece legally reach the King?
+            if (isMoveLegal(i, kingPos, board, enemyColor, state, true)) return true;
         }
     }
     return false;
 }
 
-function hasLegalMoves(board, color, state) {
+function hasLegalEscapes(board, color, state) {
     for (let i = 0; i < 64; i++) {
         if (board[i] && board[i][0] === color) {
             for (let j = 0; j < 64; j++) {
-                if (isMoveLegal(i, j, board, color, state, false)) return true;
+                if (isMoveLegal(i, j, board, color, state, true)) {
+                    const nextBoard = simulateMove(board, i, j);
+                    // A move is an "escape" ONLY if the King is no longer in check after it
+                    if (!isKingInCheck(nextBoard, color, state)) return true;
+                }
             }
         }
     }
     return false;
 }
 
-// --- WEBSOCKET LOGIC ---
+// --- WS HANDLER ---
 
 wss.on('connection', (ws, req) => {
     const parts = req.url.split('/');
     const roomId = parts[2] || 'default';
-    const size = parseInt(parts[3]) || 3;
+    const size = parseInt(parts[3]) || 8;
 
     if (!rooms.has(roomId)) {
         const hubbyIsWhite = Math.random() < 0.5;
         rooms.set(roomId, {
-            board: size === 8 ? [...initialChessBoard] : Array(size * size).fill(null),
+            board: [...initialChessBoard],
             clients: new Map(),
-            size, turn: 'w',
-            movedPieces: new Set(),
-            enPassantTarget: -1,
+            turn: 'w', movedPieces: new Set(), enPassantTarget: -1,
             roles: { Hubby: hubbyIsWhite ? 'w' : 'b', Wiifu: hubbyIsWhite ? 'b' : 'w' }
         });
     }
@@ -130,56 +129,78 @@ wss.on('connection', (ws, req) => {
     room.clients.set(ws, myRole);
     const myColor = room.roles[myRole] || 'observer';
 
+    // Welcome message
     ws.send(JSON.stringify({ type: 'ASSIGN_ROLE', role: myRole, color: myColor }));
     ws.send(JSON.stringify({ type: 'STATE', board: room.board, turn: room.turn, hubbyColor: room.roles.Hubby, wiifuColor: room.roles.Wiifu }));
 
     ws.on('message', (data) => {
         try {
             const msg = JSON.parse(data);
+
             if (msg.type === 'EMOTE') {
-                const res = JSON.stringify({ type: 'EMOTE', emoji: msg.emoji, sender: myRole });
-                room.clients.forEach((r, client) => { if (client.readyState === 1) client.send(res); });
+                const emote = JSON.stringify({ type: 'EMOTE', emoji: msg.emoji, sender: myRole });
+                room.clients.forEach((r, client) => { if (client.readyState === 1) client.send(emote); });
                 return;
             }
 
-            if (msg.type === 'RESET') {
-                room.board = size === 8 ? [...initialChessBoard] : Array(size * size).fill(null);
-                room.turn = 'w'; room.movedPieces.clear(); room.enPassantTarget = -1;
-            } else if (msg.type === 'MOVE') {
-                if (size === 8) {
-                    if (room.turn !== myColor) return;
-                    if (isMoveLegal(msg.from, msg.to, room.board, myColor, room)) {
-                        let tempBoard = simulateMove(room.board, msg.from, msg.to);
-                        // Pawn Promotion & Special moves logic
-                        room.board = tempBoard;
-                        room.movedPieces.add(msg.from);
-                        room.turn = room.turn === 'w' ? 'b' : 'w';
+            if (msg.type === 'MOVE') {
+                if (room.turn !== myColor) return;
+
+                if (isMoveLegal(msg.from, msg.to, room.board, myColor, room)) {
+                    let tempBoard = simulateMove(room.board, msg.from, msg.to);
+                    const piece = room.board[msg.from];
+                    
+                    // 1. En Passant Capture logic
+                    if (piece[1] === 'P' && msg.to === room.enPassantTarget) {
+                        tempBoard[msg.to + (myColor === 'w' ? 8 : -8)] = null;
                     }
-                } else {
-                    room.board[msg.index] = myColor === 'w' ? 'X' : 'O';
+
+                    // 2. Promotion (Auto-Queen)
+                    const targetRow = Math.floor(msg.to / 8);
+                    if (piece[1] === 'P' && (targetRow === 0 || targetRow === 7)) {
+                        tempBoard[msg.to] = myColor + 'Q';
+                    }
+
+                    // 3. Update Room
+                    room.board = tempBoard;
+                    room.movedPieces.add(msg.from);
+                    room.enPassantTarget = (piece[1] === 'P' && Math.abs(msg.to - msg.from) === 16) ? (msg.from + msg.to) / 2 : -1;
+
+                    // 4. CHECKMATE SCAN (Post-Move)
+                    const nextTurn = room.turn === 'w' ? 'b' : 'w';
+                    const enemyInCheck = isKingInCheck(room.board, nextTurn, room);
+                    const canOpponentEscape = hasLegalEscapes(room.board, nextTurn, room);
+
+                    let winner = null;
+                    let isDraw = false;
+
+                    if (!canOpponentEscape) {
+                        if (enemyInCheck) winner = myRole; // Checkmate detected
+                        else isDraw = true;               // Stalemate detected
+                    }
+
+                    room.turn = nextTurn;
+
+                    // 5. Broadcast final state
+                    const stateUpdate = JSON.stringify({
+                        type: 'STATE', board: room.board, turn: room.turn,
+                        inCheck: enemyInCheck, winner: winner, isDraw: isDraw,
+                        hubbyColor: room.roles.Hubby, wiifuColor: room.roles.Wiifu
+                    });
+
+                    room.clients.forEach((r, client) => { if (client.readyState === 1) client.send(stateUpdate); });
                 }
             }
-
-            const inCheck = size === 8 ? isKingInCheck(room.board, room.turn, room) : false;
-            const noMoves = size === 8 ? !hasLegalMoves(room.board, room.turn, room) : false;
-
-            const stateRes = JSON.stringify({
-                type: 'STATE', board: room.board, turn: room.turn,
-                inCheck, winner: (noMoves && inCheck) ? (myRole) : null,
-                isDraw: (noMoves && !inCheck), hubbyColor: room.roles.Hubby, wiifuColor: room.roles.Wiifu
-            });
-
-            room.clients.forEach((r, client) => { if (client.readyState === 1) client.send(stateRes); });
-        } catch (e) { console.log(e); }
+        } catch (e) { console.log("Error:", e); }
     });
 
     ws.on('close', () => {
         const role = room.clients.get(ws);
         room.clients.delete(ws);
         if (room.clients.size > 0) {
-            room.clients.forEach((r, c) => c.send(JSON.stringify({ type: 'KICK', message: `${role} left.` })));
+            room.clients.forEach((r, c) => c.send(JSON.stringify({ type: 'KICK', message: `${role} left. Game over!` })));
         } else rooms.delete(roomId);
     });
 });
 
-server.listen(port, () => console.log(`Hybrid Server on ${port}`));
+server.listen(port, () => console.log(`Hubby & Wiifu Server running on port ${port}`));
