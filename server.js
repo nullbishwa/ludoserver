@@ -48,7 +48,7 @@ function isMoveLegal(from, to, board, playerColor, state, skipKingCheck = false)
     if (!piece || piece[0] !== playerColor) return false;
     const target = board[to];
     if (target && target[0] === playerColor) return false;
-    
+
     const fromRow = Math.floor(from / 8), fromCol = from % 8;
     const toRow = Math.floor(to / 8), toCol = to % 8;
     const rowDiff = Math.abs(toRow - fromRow), colDiff = Math.abs(toCol - fromCol);
@@ -113,7 +113,7 @@ function hasLegalEscapes(board, color, state) {
 wss.on('connection', (ws, req) => {
     const parts = req.url.split('/');
     const roomId = parts[2] || 'default';
-    
+
     if (!rooms.has(roomId)) {
         const hubbyIsWhite = Math.random() < 0.5;
         rooms.set(roomId, {
@@ -133,6 +133,8 @@ wss.on('connection', (ws, req) => {
     ws.send(JSON.stringify({ type: 'ASSIGN_ROLE', role: myRole, color: myColor }));
     ws.send(JSON.stringify({ type: 'STATE', board: room.board, turn: room.turn, winner: room.winner, isDraw: room.isDraw }));
 
+    // ... (keep your simulateMove, isPathClear, isMoveLegal, etc. exactly as they are)
+
     ws.on('message', (data) => {
         try {
             const msg = JSON.parse(data);
@@ -144,7 +146,6 @@ wss.on('connection', (ws, req) => {
             }
 
             if (msg.type === 'MOVE') {
-                // GAME LOCK: Reject moves if game is over
                 if (room.winner || room.isDraw) return;
                 if (room.turn !== myColor) return;
 
@@ -152,7 +153,7 @@ wss.on('connection', (ws, req) => {
                     let tempBoard = simulateMove(room.board, msg.from, msg.to);
                     const piece = room.board[msg.from];
 
-                    // Special Moves Execution
+                    // 1. Special Moves Execution
                     if (piece[1] === 'P' && msg.to === room.enPassantTarget) {
                         tempBoard[msg.to + (myColor === 'w' ? 8 : -8)] = null;
                     }
@@ -171,26 +172,45 @@ wss.on('connection', (ws, req) => {
                     room.movedPieces.add(msg.from);
                     room.enPassantTarget = (piece[1] === 'P' && Math.abs(msg.to - msg.from) === 16) ? (msg.from + msg.to) / 2 : -1;
 
-                    const nextTurn = room.turn === 'w' ? 'b' : 'w';
-                    const enemyInCheck = isKingInCheck(room.board, nextTurn, room);
-                    const canOpponentEscape = hasLegalEscapes(room.board, nextTurn, room);
+                    // 2. SWAP TURN BEFORE CALCULATION
+                    room.turn = room.turn === 'w' ? 'b' : 'w';
+
+                    // 3. WINNER & CHECK DETECTION
+                    const whiteInCheck = isKingInCheck(room.board, 'w', room);
+                    const blackInCheck = isKingInCheck(room.board, 'b', room);
+                    const canOpponentEscape = hasLegalEscapes(room.board, room.turn, room);
 
                     if (!canOpponentEscape) {
-                        if (enemyInCheck) room.winner = myRole;
+                        const currentInCheck = room.turn === 'w' ? whiteInCheck : blackInCheck;
+                        if (currentInCheck) room.winner = myRole; // The person who just moved wins!
                         else room.isDraw = true;
                     }
 
-                    room.turn = nextTurn;
+                    const stateUpdate = JSON.stringify({
+                        type: 'STATE',
+                        board: room.board,
+                        turn: room.turn,
+                        whiteKingCheck: whiteInCheck,
+                        blackKingCheck: blackInCheck,
+                        checkedKingIndex: room.board.indexOf((whiteInCheck ? 'w' : (blackInCheck ? 'b' : '')) + 'K'),
+                        winner: room.winner,
+                        isDraw: room.isDraw,
+                        hubbyColor: room.roles.Hubby,
+                        wiifuColor: room.roles.Wiifu
+                    });
+
+                    room.clients.forEach((r, client) => { if (client.readyState === 1) client.send(stateUpdate); });
+                    return; // VERY IMPORTANT: Prevent the second broadcast below
                 }
             }
 
-            const stateUpdate = JSON.stringify({
+            // Broadcast for RESET or EMOTES
+            const fallbackRes = JSON.stringify({
                 type: 'STATE', board: room.board, turn: room.turn,
-                inCheck: isKingInCheck(room.board, room.turn, room),
                 winner: room.winner, isDraw: room.isDraw,
                 hubbyColor: room.roles.Hubby, wiifuColor: room.roles.Wiifu
             });
-            room.clients.forEach((r, c) => { if (c.readyState === 1) c.send(stateUpdate); });
+            room.clients.forEach((r, c) => { if (c.readyState === 1) c.send(fallbackRes); });
 
         } catch (e) { console.log(e); }
     });
