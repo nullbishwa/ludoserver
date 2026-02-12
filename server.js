@@ -173,16 +173,19 @@ wss.on('connection', (ws, req) => {
                     room.enPassantTarget = (piece[1] === 'P' && Math.abs(msg.to - msg.from) === 16) ? (msg.from + msg.to) / 2 : -1;
 
                     // 2. SWAP TURN BEFORE CALCULATION
+                    // 2. SWAP TURN BEFORE CALCULATION
                     room.turn = room.turn === 'w' ? 'b' : 'w';
 
                     // 3. WINNER & CHECK DETECTION
                     const whiteInCheck = isKingInCheck(room.board, 'w', room);
                     const blackInCheck = isKingInCheck(room.board, 'b', room);
                     const canOpponentEscape = hasLegalEscapes(room.board, room.turn, room);
+
                     if (!canOpponentEscape) {
-                        const kingInCheck = isKingInCheck(room.board, room.turn, room);
-                        if (kingInCheck) {
-                            room.winner = (room.turn === 'w' ? 'Wiifu' : 'Hubby'); // The player who just moved wins
+                        const currentInCheck = room.turn === 'w' ? whiteInCheck : blackInCheck;
+                        if (currentInCheck) {
+                            // The person who just moved (myRole) is the winner
+                            room.winner = myRole;
                         } else {
                             room.isDraw = true;
                         }
