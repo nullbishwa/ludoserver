@@ -179,11 +179,13 @@ wss.on('connection', (ws, req) => {
                     const whiteInCheck = isKingInCheck(room.board, 'w', room);
                     const blackInCheck = isKingInCheck(room.board, 'b', room);
                     const canOpponentEscape = hasLegalEscapes(room.board, room.turn, room);
-
                     if (!canOpponentEscape) {
-                        const currentInCheck = room.turn === 'w' ? whiteInCheck : blackInCheck;
-                        if (currentInCheck) room.winner = myRole; // The person who just moved wins!
-                        else room.isDraw = true;
+                        const kingInCheck = isKingInCheck(room.board, room.turn, room);
+                        if (kingInCheck) {
+                            room.winner = (room.turn === 'w' ? 'Wiifu' : 'Hubby'); // The player who just moved wins
+                        } else {
+                            room.isDraw = true;
+                        }
                     }
 
                     const stateUpdate = JSON.stringify({
