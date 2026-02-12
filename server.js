@@ -174,23 +174,27 @@ wss.on('connection', (ws, req) => {
 
                     // 2. SWAP TURN BEFORE CALCULATION
                     // 2. SWAP TURN BEFORE CALCULATION
+                    // 1. SWAP TURN BEFORE CALCULATION
                     room.turn = room.turn === 'w' ? 'b' : 'w';
 
-                    // 3. WINNER & CHECK DETECTION
+                    // 2. FORCE CHECKMATE DETECTION
                     const whiteInCheck = isKingInCheck(room.board, 'w', room);
                     const blackInCheck = isKingInCheck(room.board, 'b', room);
+
+                    // Identify if the person whose turn it IS NOW can escape
                     const canOpponentEscape = hasLegalEscapes(room.board, room.turn, room);
 
                     if (!canOpponentEscape) {
-                        const currentInCheck = room.turn === 'w' ? whiteInCheck : blackInCheck;
-                        if (currentInCheck) {
-                            // The person who just moved (myRole) is the winner
+                        const currentKingInCheck = (room.turn === 'w' ? whiteInCheck : blackInCheck);
+                        if (currentKingInCheck) {
+                            // The person who just moved (myRole) is the winner because the opponent is trapped!
                             room.winner = myRole;
                         } else {
                             room.isDraw = true;
                         }
                     }
 
+                    // 3. BROADCAST TO BOTH APPS
                     const stateUpdate = JSON.stringify({
                         type: 'STATE',
                         board: room.board,
